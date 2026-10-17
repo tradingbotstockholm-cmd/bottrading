@@ -1,0 +1,35 @@
+{
+  "mode": "READ_ONLY_LIVE_PROBE",
+  "results": [
+    {
+      "check": "solana_health",
+      "status": "failed",
+      "error_type": "RemoteError",
+      "http_status": 403
+    },
+    {
+      "check": "dex_pairs",
+      "status": "failed",
+      "error_type": "RemoteError",
+      "http_status": 403
+    },
+    {
+      "check": "sol_usd",
+      "status": "failed",
+      "error_type": "RemoteError",
+      "http_status": 403
+    },
+    {
+      "check": "rugcheck_response",
+      "status": "failed",
+      "error_type": "RemoteError",
+      "http_status": 403
+    },
+    {
+      "check": "free_launch_feed",
+      "status": "failed",
+      "error_type": "InvalidProxyStatus"
+    }
+  ],
+  "paper_fill_validation": "NOT ESTABLISHED; needs qualifying observed swaps and full scanner run"
+}

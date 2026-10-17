@@ -16,7 +16,7 @@ def main():
     args=parser.parse_args()
     cfg=load_settings(args.config)
     client=SolanaClient(cfg.solana_rpc_url)
-    for wallet in cfg.tracked_wallets[:3]:
+    for wallet in (cfg.tracked_wallets or [])[:3]:
         print('Wallet:',wallet)
         try:rows=client.signatures(wallet,max(1,min(args.limit,15)))
         except Exception as exc:

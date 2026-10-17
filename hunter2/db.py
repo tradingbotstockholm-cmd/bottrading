@@ -2,13 +2,30 @@
 No external API credentials or private keys ever persisted.
 """
 from __future__ import annotations
-import sqlite3,json,time,threading
+import sqlite3,json,time,threading,functools,weakref
 from pathlib import Path
+
+_LOCKS=weakref.WeakValueDictionary()
+_LOCKS_GUARD=threading.Lock()
+
+def snapshot_read(method):
+    @functools.wraps(method)
+    def read(self,*args,**kwargs):
+        with self.lock:
+            own_transaction=not self.conn.in_transaction
+            if own_transaction:self.conn.execute('BEGIN')
+            try:return method(self,*args,**kwargs)
+            finally:
+                if own_transaction:self.conn.rollback()
+    return read
 
 class Database:
     def __init__(self,path='data/hunter2.sqlite',initial_cash=1000.):
         self.path=str(path);Path(path).parent.mkdir(parents=True,exist_ok=True)
-        self.lock=threading.RLock()
+        key=str(Path(path).resolve()) if str(path)!=':memory:' else object()
+        with _LOCKS_GUARD:
+            self.lock=_LOCKS.get(key) or threading.RLock()
+            _LOCKS[key]=self.lock
         self.conn=sqlite3.connect(self.path,check_same_thread=False,timeout=12)
         self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.execute('PRAGMA busy_timeout=12000')
@@ -17,6 +34,7 @@ CREATE TABLE IF NOT EXISTS state(id INTEGER PRIMARY KEY CHECK(id=1),json TEXT NO
 CREATE TABLE IF NOT EXISTS fills(id INTEGER PRIMARY KEY AUTOINCREMENT,time REAL NOT NULL,mint TEXT,side TEXT,units REAL,price REAL,net_usd REAL,pnl_usd REAL,reason TEXT,wallets TEXT,liquidity REAL);
 CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY AUTOINCREMENT,time REAL,mint TEXT,kind TEXT,detail TEXT);
 CREATE TABLE IF NOT EXISTS seen(wallet TEXT NOT NULL,signature TEXT NOT NULL, PRIMARY KEY(wallet,signature));
+CREATE TABLE IF NOT EXISTS pending_signatures(wallet TEXT NOT NULL, signature TEXT NOT NULL, queued REAL NOT NULL, PRIMARY KEY(wallet,signature));
 CREATE TABLE IF NOT EXISTS wallet_checkpoints(wallet TEXT PRIMARY KEY, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS candidate_mints(mint TEXT PRIMARY KEY,observed REAL,curve TEXT,source TEXT);
 CREATE INDEX IF NOT EXISTS idx_fills_time ON fills(time);
@@ -78,6 +96,29 @@ CREATE TABLE IF NOT EXISTS ai_shadow(id INTEGER PRIMARY KEY AUTOINCREMENT,mint T
     def observe(self,mint,kind,detail):
         with self.lock,self.conn:
             self.conn.execute('INSERT INTO observations(time,mint,kind,detail) VALUES(?,?,?,?)',(time.time(),mint,kind,str(detail)[:500]))
+    def diagnostic(self,mint,stage,code,details=None):
+        # Structured, additive instrumentation; no ledger migration or reset.
+        payload=json.dumps({'stage':stage,'code':code,'details':details or {}},
+                           allow_nan=False,separators=(',',':'))
+        with self.lock,self.conn:
+            self.conn.execute('INSERT INTO observations(time,mint,kind,detail) VALUES(?,?,?,?)',
+                              (time.time(),mint,'execution',payload))
+    def execution_diagnostics(self):
+        with self.lock:
+            rows=self.conn.execute("SELECT time,mint,detail FROM observations WHERE kind='execution' ORDER BY id DESC LIMIT 200").fetchall()
+            counts=self.conn.execute("""SELECT json_extract(detail,'$.stage'),json_extract(detail,'$.code'),COUNT(*)
+                FROM observations WHERE kind='execution' AND json_valid(detail)
+                GROUP BY 1,2""").fetchall()
+            detected=self.conn.execute('SELECT COUNT(*) FROM candidate_mints').fetchone()[0]
+        recent=[]
+        for stamp,mint,raw in rows:
+            try:recent.append({'time':stamp,'mint':mint,**json.loads(raw)})
+            except (ValueError,TypeError):continue
+        return {'mode':'observed inputs / simulated paper execution',
+                'count_unit':'stage events (retries included), not unique trades',
+                'detected_mints':detected,
+                'counts':[{'stage':stage,'code':code,'count':n} for stage,code,n in counts],
+                'recent':recent}
     def record_error(self,kind,detail):self.observe('',kind,detail)
     def record_runtime(self, values, now=None):
         """Persist one scanner heartbeat without changing any trading history."""
@@ -91,9 +132,17 @@ CREATE TABLE IF NOT EXISTS ai_shadow(id INTEGER PRIMARY KEY AUTOINCREMENT,mint T
         with self.lock:return self.conn.execute('SELECT 1 FROM wallet_checkpoints WHERE wallet=?',(wallet,)).fetchone() is not None
     def has_seen(self,wallet,signature):
         with self.lock:return self.conn.execute('SELECT 1 FROM seen WHERE wallet=? AND signature=?',(wallet,signature)).fetchone() is not None
+    def enqueue_pending(self,wallet,signatures):
+        with self.lock,self.conn:
+            self.conn.executemany('INSERT OR IGNORE INTO pending_signatures VALUES(?,?,?)',
+                                  [(wallet,sig,time.time()) for sig in signatures])
+    def pending_signatures(self,wallet,limit):
+        with self.lock:
+            return [r[0] for r in self.conn.execute('SELECT signature FROM pending_signatures WHERE wallet=? ORDER BY queued LIMIT ?', (wallet,limit))]
     def mark_seen(self,wallet,signatures):
         with self.lock,self.conn:
             self.conn.execute('INSERT OR IGNORE INTO wallet_checkpoints(wallet,created) VALUES(?,?)',(wallet,time.time()))
+            self.conn.executemany('DELETE FROM pending_signatures WHERE wallet=? AND signature=?',[(wallet,s) for s in signatures])
             self.conn.executemany('INSERT OR IGNORE INTO seen(wallet,signature) VALUES(?,?)',[(wallet,s) for s in signatures])
     def remember_mint(self,mint,curve='',source='pumpportal'):
         with self.lock,self.conn:
@@ -172,6 +221,7 @@ CREATE TABLE IF NOT EXISTS ai_shadow(id INTEGER PRIMARY KEY AUTOINCREMENT,mint T
 
     def scout_mark_signature(self,mint,signature):
         with self.lock,self.conn:
+            self.conn.execute('DELETE FROM pending_signatures WHERE wallet=? AND signature=?',('scout:'+mint,signature))
             self.conn.execute('INSERT OR IGNORE INTO scout_signatures(mint,signature) VALUES(?,?)',
                               (mint,signature))
 
@@ -269,7 +319,12 @@ CREATE TABLE IF NOT EXISTS ai_shadow(id INTEGER PRIMARY KEY AUTOINCREMENT,mint T
         sells=[float(pnl) for side,pnl,_,_ in rows if side=='sell']
         wins=[x for x in sells if x>0]
         losses=[x for x in sells if x<0]
+        st=self.state()
+        with self.lock:
+            costs=self.conn.execute("SELECT COALESCE(SUM(CASE WHEN side='buy' THEN -net_usd-units*price ELSE units*price-net_usd END),0) FROM fills").fetchone()[0]
         return {
+          'modeled_execution_cost_usd':costs,
+          'unrealized_pnl_usd':sum(p['units']*p['last_price']*.98-p['basis'] for p in st['positions'].values()),
           'paper_buy_fills':buys,'paper_sell_fills':len(sells),
           'realized_pnl_usd':round(sum(sells),4),
           'gross_profit_usd':round(sum(wins),4),
@@ -323,6 +378,7 @@ CREATE TABLE IF NOT EXISTS ai_shadow(id INTEGER PRIMARY KEY AUTOINCREMENT,mint T
             writer.writerows(cur.fetchall())
         return out.getvalue()
 
+    @snapshot_read
     def snapshot(self):
         """Read-only status snapshot: missing heartbeats are clearly identified."""
         st=self.state();fills=self.recent_fills(250);now=time.time()
@@ -359,6 +415,7 @@ CREATE TABLE IF NOT EXISTS ai_shadow(id INTEGER PRIMARY KEY AUTOINCREMENT,mint T
                   latest_scans=[dict(zip(('time','detail'),x)) for x in latest_scans],
                   latest_errors=[dict(zip(('time','kind','detail'),x)) for x in latest_errors],
                   runtime=runtime,server_time=now,
+                  execution_diagnostics=self.execution_diagnostics(),
                   fills=fills,performance=self.performance(),ai_shadow=self.ai_shadow_recent(),leaderboard=self.leaderboard(),
                   observations=[dict(zip(('time','mint','kind','detail'),r)) for r in ob])
         return st

@@ -123,7 +123,7 @@ class FastStreamTests(unittest.TestCase):
         source=Path(__file__).parent.parent/'config.v4.example.json'
         cfgpath.write_text(source.read_text())
         cfg=load_settings(cfgpath)
-        self.assertTrue(cfg.enable_fomo_research_feed)
+        self.assertFalse(cfg.enable_fomo_research_feed)
         self.assertEqual(cfg.market_queue_limit,8192)
 
 

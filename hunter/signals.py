@@ -18,7 +18,7 @@ class Consensus:
 
     def voters(self, mint: str, now: float | None=None) -> list[str]:
         now=time() if now is None else now
-        self.events[mint]={w:t for w,t in self.events[mint].items() if now-t<=self.ttl}
+        self.events[mint]={w:t for w,t in self.events[mint].items() if 0<=now-t<=self.ttl}
         return list(self.events[mint])
 
     def consensus(self, mint: str, minimum: int, now: float | None=None) -> bool:

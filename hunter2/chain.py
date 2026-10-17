@@ -5,6 +5,9 @@ Transfers and fee-only transfers are not buy/sell signals.
 from __future__ import annotations
 import time
 import threading
+import math, json, random
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from hunter.http import post_json, RemoteError
@@ -101,7 +104,7 @@ def extract_wallet_trades(tx:dict, wallet:str, signature:str, now:float|None=Non
         side='buy' if delta>0 else 'sell'
         if side=='buy' and not(native_spend or wsol_spend or stable_spend):continue
         if side=='sell' and not(native_gain or wsol_gain or stable_gain):continue
-        result.append(WalletSignal(wallet,mint,side,signature,int(tx.get('slot') or 0),time.time() if now is None else now))
+        result.append(WalletSignal(wallet,mint,side,signature,int(tx.get('slot') or 0),float(tx.get('blockTime') or 0)))
     return result
 
 class RpcRateLimited(RemoteError):
@@ -112,20 +115,35 @@ class SolanaClient:
     def __init__(self, endpoint:str):
         self.endpoint=endpoint
         self._lock=threading.Lock()
+        self.lock_wait_timeout=8
         self._last_call=0.0
         self._last_transaction=0.0
         self._cooldown_until={}
         self._rate_limit_strikes={}
+        self._transaction_cache=OrderedDict()
+        self.requests=0
+        self.errors=0
         # Public shared endpoints cannot sustain the scanner's original bursts.
         # Custom RPC users retain the earlier faster defaults.
         self._public_rpc=endpoint.rstrip('/').split('?',1)[0] in (
             'https://api.mainnet-beta.solana.com','https://api.mainnet.solana.com')
 
-    def call(self,method:str,params:list):
+    @contextmanager
+    def request_slot(self):
+        if not self._lock.acquire(timeout=self.lock_wait_timeout):
+            raise RemoteError('RPC concurrency wait timeout')
+        try:yield
+        finally:self._lock.release()
+
+    def call(self,method:str,params:list,*,transport=None):
         # All scanner and wallet-poller calls share one RPC client. Serialize
         # network activity so discovery cannot burst through the public limit.
-        with self._lock:
+        with self.request_slot():
             now=time.monotonic()
+            cache_key=json.dumps(params,sort_keys=True)
+            if method=='getTransaction' and cache_key in self._transaction_cache:
+                seen,result=self._transaction_cache[cache_key]
+                if now-seen<30:return result
             remaining=self._cooldown_until.get(method,0.0)-now
             if remaining>0:
                 raise RpcRateLimited(f'{method}: HTTP 429 cooldown; retry in {remaining:.0f}s', status=429,
@@ -140,7 +158,8 @@ class SolanaClient:
             last_error=None
             for attempt in range(3):
                 try:
-                    response=post_json(self.endpoint,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
+                    self.requests+=1
+                    response=(transport or post_json)(self.endpoint,{'jsonrpc':'2.0','id':1,'method':method,'params':params})
                     if not isinstance(response,dict):raise ValueError('invalid RPC response')
                     if response.get('error'):
                         err=response['error']
@@ -150,21 +169,25 @@ class SolanaClient:
                         raise ValueError('RPC error '+str(code if code is not None else 'unknown'))
                     if 'result' not in response:raise ValueError('missing RPC result')
                     self._rate_limit_strikes[method]=0
+                    if method=='getTransaction' and response['result'] is not None:
+                        self._transaction_cache[cache_key]=(time.monotonic(),response['result'])
+                        while len(self._transaction_cache)>256:self._transaction_cache.popitem(last=False)
                     return response['result']
                 except Exception as exc:
+                    self.errors+=1
                     last_error=exc
                     if isinstance(exc,RemoteError) and exc.status==429:
                         strikes=min(5,self._rate_limit_strikes.get(method,0)+1)
                         self._rate_limit_strikes[method]=strikes
                         provider_wait=exc.retry_after
-                        wait=provider_wait if provider_wait is not None else 30*(2**(strikes-1))
-                        wait=min(300.0,max(15.0,float(wait)))
+                        wait=max(15.0,float(provider_wait)) if provider_wait is not None else min(300.0,30*(2**(strikes-1))+random.uniform(0,3))
                         self._cooldown_until[method]=time.monotonic()+wait
                         # No immediate retry: that can extend the block.
                         raise RpcRateLimited(f'{method}: HTTP 429; retry after {wait:.0f}s',
                                              status=429,retry_after=wait) from exc
                     if attempt==2:break
-                    time.sleep(min(1.2,0.35*(2**attempt)))
+                    if isinstance(exc,RemoteError) and exc.status is not None and 400<=exc.status<500:break
+                    time.sleep(min(1.2,0.35*(2**attempt))+random.uniform(0,.1))
             raise last_error
 
     def signatures(self,wallet:str,limit:int=12):
@@ -172,10 +195,19 @@ class SolanaClient:
     def transaction(self,signature:str):
         return self.call('getTransaction',[signature,{'encoding':'jsonParsed','commitment':'confirmed','maxSupportedTransactionVersion':0}])
 
+_CLIENTS={}
+_CLIENTS_LOCK=threading.Lock()
+
+def shared_client(endpoint):
+    """One paced, bounded transport for scanner, pricing and safety per endpoint."""
+    with _CLIENTS_LOCK:
+        if endpoint not in _CLIENTS:_CLIENTS[endpoint]=SolanaClient(endpoint)
+        return _CLIENTS[endpoint]
+
 class WalletPoller:
     """Per-wallet checkpoints, no historical backfill or double processing.
     First sighting establishes baseline (rather than triggering late copy trades).
-    All observed signatures marked as seen before RPC details fetch to avoid replay.
+    Pending signatures survive transient failures, truncated RPC windows and restarts.
     """
     def __init__(self, client, ledger,limit:int=12):self.client,self.ledger,self.limit=client,ledger,limit
     def poll(self,wallet:str,now:float|None=None) -> list[WalletSignal]:
@@ -188,14 +220,22 @@ class WalletPoller:
         if not baseline:
             self.ledger.mark_seen(wallet,unseen)
             return []
+        self.ledger.enqueue_pending(wallet,list(reversed(unseen)))
         signals=[]
-        for signature in reversed(unseen):
+        for signature in self.ledger.pending_signatures(wallet,self.limit):
             try:
                 tx=self.client.transaction(signature)
                 if tx is None:continue  # not yet indexed; retry on next poll
-                parsed=extract_wallet_trades(tx,wallet,signature,now)
+                bt=tx.get('blockTime')
+                current=time.time() if now is None else now
+                keys=((tx.get('transaction') or {}).get('message') or {}).get('accountKeys',[])
+                signer=any(isinstance(k,dict) and k.get('pubkey')==wallet and k.get('signer') is True for k in keys)
+                fresh=isinstance(bt,(int,float)) and not isinstance(bt,bool) and math.isfinite(bt) and 0<=current-bt<=120
+                parsed=extract_wallet_trades(tx,wallet,signature,now) if signer and fresh else []
+                if not fresh:self.ledger.diagnostic('', 'wallet', 'transaction_stale_or_missing_blocktime',{'signature':signature})
                 self.ledger.mark_seen(wallet,[signature])
                 signals.extend(parsed)
             except Exception as exc:
                 self.ledger.record_error('wallet_tx',f'{wallet[:7]}:{type(exc).__name__}')
+                if isinstance(exc,RpcRateLimited):break
         return signals

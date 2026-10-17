@@ -8,6 +8,7 @@ from hunter2.chain import (extract_wallet_trades,_programs,SolanaClient,WalletPo
 from hunter2.db import Database
 from hunter2.broker import Broker
 from hunter2.security import SecurityGate
+from hunter2.bonding_quote import canonical_curve_address
 from hunter2.replay import replay
 
 W='4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'
@@ -17,7 +18,7 @@ T=time.time()
 def quote(p=.001,cap=15000,liq=10000):return Quote(M,p,cap,liq,'pump',time.time())
 def token(m,amt,dec=6,owner=W):return {'mint':m,'owner':owner,'uiTokenAmount':{'amount':str(amt),'decimals':dec}}
 def tx(program=PUMP_PROGRAM, before=None,after=None,native_pre=2_000_000_000,native_post=1_900_000_000,err=None):
-    return {'slot':900,'transaction':{'message':{'accountKeys':[{'pubkey':W},{'pubkey':program}],
+    return {'blockTime':time.time(),'slot':900,'transaction':{'message':{'accountKeys':[{'pubkey':W,'signer':True},{'pubkey':program,'signer':False}],
           'instructions':[{'programIdIndex':1,'data':'1234'}]}},
           'meta':{'err':err,'preBalances':[native_pre,0],'postBalances':[native_post,0],
           'preTokenBalances':before or [],'postTokenBalances':after or []}}
@@ -161,7 +162,7 @@ class RiskTests(unittest.TestCase):
         self.gate.rpc=Bad()
         from unittest.mock import patch
         with patch('hunter2.security.get_json',return_value={'score_normalised':0,'risks':[]}):
-            r=self.gate.examine(M,W)
+            r=self.gate.examine(M,canonical_curve_address(M))
         self.assertFalse(r.approved)
     def test_reject_score(self):
         class Good:
@@ -169,28 +170,28 @@ class RiskTests(unittest.TestCase):
         self.gate.rpc=Good()
         from unittest.mock import patch
         with patch('hunter2.security.get_json',return_value={'score_normalised':55,'risks':[]}):
-            self.assertFalse(self.gate.examine(M,W).approved)
+            self.assertFalse(self.gate.examine(M,canonical_curve_address(M)).approved)
     def test_accept_when_complete(self):
         class Good:
             def examine(self,*a):return type('R',(),{'allowed':True,'reasons':[]})()
         self.gate.rpc=Good()
         from unittest.mock import patch
         with patch('hunter2.security.get_json',return_value={'score_normalised':10,'risks':[]}):
-            self.assertTrue(self.gate.examine(M,W).approved)
+            self.assertTrue(self.gate.examine(M,canonical_curve_address(M)).approved)
     def test_reject_critical(self):
         class Good:
             def examine(self,*a):return type('R',(),{'allowed':True,'reasons':[]})()
         self.gate.rpc=Good()
         from unittest.mock import patch
         with patch('hunter2.security.get_json',return_value={'score_normalised':10,'risks':[{'name':'unsafe','level':'danger'}]}):
-            self.assertFalse(self.gate.examine(M,W).approved)
+            self.assertFalse(self.gate.examine(M,canonical_curve_address(M)).approved)
     def test_reject_missing_rugcheck(self):
         class Good:
             def examine(self,*a):return type('R',(),{'allowed':True,'reasons':[]})()
         self.gate.rpc=Good()
         from unittest.mock import patch
         with patch('hunter2.security.get_json',side_effect=ConnectionError):
-            self.assertFalse(self.gate.examine(M,W).approved)
+            self.assertFalse(self.gate.examine(M,canonical_curve_address(M)).approved)
 
 class SettingsReplayTests(unittest.TestCase):
     def test_replay_nonempty(self):

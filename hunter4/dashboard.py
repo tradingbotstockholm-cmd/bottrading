@@ -40,14 +40,20 @@ button{background:#1d3750;color:#edf4ff;border:1px solid #355a7b;border-radius:7
 <div class="card">FOMO research hints / 10 min<div class="big" id="fomo">—</div><div class="mini">Unofficial delayed hints; not verified votes</div></div>
 <div class="card">Monitored RPC wallets<div class="big" id="rpcWallets">—</div><div class="mini">Public on-chain wallet tracking</div></div>
 <div class="card">Open paper positions<div class="big" id="positions">—</div><div class="mini">Requires independent wallet consensus</div></div>
-<div class="card">Paper buys / sells<div class="big" id="tradeCounts">—</div><div class="mini">Real-market-observed paper fills; synthetic trials excluded</div></div>
+<div class="card">Paper buys / sells<div class="big" id="tradeCounts">—</div><div class="mini">Simulated fills in selected ledger; verify input provenance</div></div>
 <div class="card">Realized paper PnL<div class="big" id="realized">—</div><div class="mini">Net of modeled execution costs, not on-chain cash</div></div>
 <div class="card">Gross profit / gross loss<div class="big" id="profitLoss">—</div><div class="mini">From sell fills only</div></div>
 <div class="card">Winning sell fills<div class="big" id="winRate">—</div><div class="mini">Partial exits count separately; not trade-level win rate</div></div>
 <div class="card">Rejected / rug-rejected<div class="big" id="rejections">—</div><div class="mini">Entry gate failures logged by scanner</div></div>
 <div class="card">Paper cash<div class="big" id="cash">—</div><div class="mini">Simulated USD account only</div></div>
-<div class="card">Paper equity<div class="big" id="equity">—</div><div class="mini">Modeled mark to market; includes exits/fees</div></div>
+<div class="card">Paper equity<div class="big" id="equity">—</div><div class="mini">Indicative mark × 0.98; not an executable exit quote</div></div>
 </div>
+<section><h2>Execution Diagnostics</h2>
+<p>Detected → Consensus → Quoted → Security Checked → Broker Approved → Paper Filled.
+Counts are persisted stage events, including retries, not a conversion funnel of unique trades.
+Market observations and simulated execution remain distinct; offline fixtures use separate test databases.</p>
+<div id="executionSummary"></div>
+<table><thead><tr><th>UTC</th><th>Mint</th><th>Stage</th><th>Outcome / stop reason</th><th>Details</th></tr></thead><tbody id="executionRows"></tbody></table></section>
 <div class="columns">
 <section><h2>Scanner health</h2><table><tbody id="health"></tbody></table></section>
 <section><h2>Recent research cycles</h2><table><thead><tr><th>UTC</th><th>Activity</th></tr></thead><tbody id="scans"></tbody></table></section>
@@ -57,7 +63,7 @@ button{background:#1d3750;color:#edf4ff;border:1px solid #355a7b;border-radius:7
 <section><h2>Recent connection / research errors</h2><table><thead><tr><th>UTC</th><th>Subsystem</th><th>Error</th></tr></thead><tbody id="errors"></tbody></table></section>
 </div>
 <div class="columns">
-<section><h2>Paper positions</h2><p>Signal-strength scores are heuristic evidence indices, not calibrated win probabilities.</p><table><thead><tr><th>Mint</th><th>Units</th><th>Entry</th><th>Latest</th><th>Paper allocation</th><th>Signal strength</th></tr></thead><tbody id="pos"></tbody></table></section>
+<section><h2>Paper positions</h2><p>Signal-strength scores are heuristic evidence indices, not calibrated win probabilities.</p><table><thead><tr><th>Mint</th><th>Units</th><th>Entry</th><th>Latest</th><th>Paper allocation</th><th>Signal strength</th><th>Security evidence</th></tr></thead><tbody id="pos"></tbody></table></section>
 <section><h2>Latest 250 simulated fills</h2><p><a href="/api/fills.csv" download="solana_hunter_paper_fills.csv">Export full paper fill history (CSV)</a></p><table><thead><tr><th>UTC</th><th>Mint</th><th>Side</th><th>Value</th><th>Net PnL</th></tr></thead><tbody id="fills"></tbody></table></section>
 </div>
 <section><h2>1,000 synthetic stress scenarios — NOT LIVE PnL</h2>
@@ -87,6 +93,11 @@ async function refresh(){
   const res=await fetch('/api/state',{cache:'no-store'});if(!res.ok)throw Error('HTTP '+res.status);
   const s=await res.json(),rt=s.runtime||{},perf=s.performance||{},now=s.server_time||Date.now()/1000;
   const open=Object.values(s.positions||{});
+  const diagnostics=s.execution_diagnostics||{};
+  $('executionSummary').textContent='Detected mints: '+(diagnostics.detected_mints??0)+' | '+
+    (diagnostics.counts||[]).map(x=>x.stage+'/'+x.code+': '+x.count).join(' | ');
+  table('executionRows',(diagnostics.recent||[]).map(x=>[when(x.time),short(x.mint),x.stage,x.code,JSON.stringify(x.details)]));
+
   const eq=Number(s.cash||0)+open.reduce((sum,p)=>sum+p.units*p.last_price*.98,0);
   const health=rt.scanner_online?'SCANNER LIVE':rt.heartbeat_updated_at?'SCANNER STALE':'SCANNER NOT STARTED';
   $('status').textContent=health;$('status').style.color=rt.scanner_online?'#85ebac':'#ffca95';
@@ -102,6 +113,12 @@ async function refresh(){
   }))$(k).textContent=v;
   table('health',[
    ['Scanner heartbeat',age(now,rt.heartbeat_updated_at)],
+   ['Feed connection (last heartbeat)',rt.feed_connected===undefined?'Unknown':rt.feed_connected?'CONNECTED':'DISCONNECTED'],
+   ['Last feed event age (not connection proof)',rt.feed_last_event_age_seconds??'No events'],
+   ['Shared RPC requests / errors',(rt.rpc_requests??0)+' / '+(rt.rpc_errors??0)],
+   ['RPC method cooldowns',JSON.stringify(rt.rpc_cooldowns||{})],
+   ['Modeled execution costs',money(perf.modeled_execution_cost_usd)],
+   ['Unrealized paper PnL (indicative × 0.98)',money(perf.unrealized_pnl_usd)],
    ['Pump.fun latest launch',age(now,s.latest_launch_at)],
    ['FOMO latest research hint',age(now,s.latest_fomo_at)],
    ['Paper entries',s.paused?'PAUSED':'ENABLED (subject to risk checks)'],
@@ -120,7 +137,7 @@ async function refresh(){
   table('scans',(s.latest_scans||[]).map(x=>[when(x.time),x.detail]),'Research runs periodically; no scan completed yet');
   table('tokens',(s.latest_launches||[]).map(x=>[when(x.time),short(x.mint),x.source]),'Awaiting new Pump.fun token announcements');
   table('errors',(s.latest_errors||[]).map(x=>[when(x.time),x.kind,x.detail]),'No recent recorded errors');
-  table('pos',open.map(p=>[short(p.mint),num(p.units),money(p.entry_price),money(p.last_price),money(p.basis),p.signal_strength==null?'—':num(p.signal_strength*100)+' / 100']),'No qualified paper entries yet');
+  table('pos',open.map(p=>[short(p.mint),num(p.units),money(p.entry_price),money(p.last_price),money(p.basis),p.signal_strength==null?'—':num(p.signal_strength*100)+' / 100',p.security_evidence?.status||'Legacy / unknown']),'No qualified paper entries yet');
   table('fills',(s.fills||[]).map(f=>[when(f.time),short(f.mint),f.side,money(f.net_usd),money(f.pnl_usd)]),'No simulated orders placed yet');
   table('aiShadow',(s.ai_shadow||[]).map(x=>[when(x.time),short(x.mint),num(x.low*100)+'%',num(x.median*100)+'%',num(x.high*100)+'%']),'AI offline or insufficient real price samples');
   table('obs',(s.observations||[]).slice(0,20).map(x=>[when(x.time),short(x.mint),x.kind,x.detail]),'Awaiting scanner observations');

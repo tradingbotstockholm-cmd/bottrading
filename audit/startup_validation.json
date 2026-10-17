@@ -1,0 +1,10 @@
+{
+  "startup": "passed",
+  "dashboard_http": "passed",
+  "scanner_heartbeat": true,
+  "paper_cash": 1000.0,
+  "paper_fills": 0,
+  "ledger_backup": "present",
+  "live_market_ready": false,
+  "note": "Proxy denied provider access; no observed-market fills"
+}

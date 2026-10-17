@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hunter.http import get_json
 from hunter.rug import SolanaRPC
+from .bonding_quote import canonical_curve_address
 
 @dataclass(frozen=True)
 class SecurityVerdict:
@@ -30,6 +31,12 @@ class SecurityGate:
 
     def examine(self,mint:str,curve_owner:str|None=None) -> SecurityVerdict:
         problems=[];notes=[];score=None
+        if curve_owner:
+            try:
+                if curve_owner!=canonical_curve_address(mint):
+                    problems.append('curve custody address is not the canonical Pump PDA')
+            except ValueError:
+                problems.append('invalid mint/curve custody address')
         try:
             rpc=self.rpc.examine(mint,curve_owner)
             rpc_reasons=list(rpc.reasons) if not rpc.allowed else []

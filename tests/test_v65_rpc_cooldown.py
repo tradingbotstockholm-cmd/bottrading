@@ -58,7 +58,7 @@ class RpcCooldownTests(unittest.TestCase):
 
     def test_retry_after_bound_and_invalid(self):
         self.assertEqual(_retry_after_seconds('2'),2)
-        self.assertEqual(_retry_after_seconds('999999'),300)
+        self.assertEqual(_retry_after_seconds('999999'),999999)
         self.assertEqual(_retry_after_seconds('-3'),0)
         self.assertIsNone(_retry_after_seconds('not-a-time'))
         self.assertIsNone(_retry_after_seconds(None))

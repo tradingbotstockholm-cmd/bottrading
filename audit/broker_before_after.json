@@ -1,0 +1,96 @@
+{
+  "before": {
+    "label": "DETERMINISTIC SYNTHETIC BROKER COMPARISON; not live market evidence",
+    "planned_allocation": 30.0,
+    "modeled_buy_slippage": 0.01205188141391106,
+    "buy_approved": false,
+    "cash": 1000.0,
+    "fills": [],
+    "diagnostics": null
+  },
+  "after": {
+    "label": "DETERMINISTIC SYNTHETIC BROKER COMPARISON; not live market evidence",
+    "planned_allocation": 14.032,
+    "modeled_buy_slippage": 0.0075,
+    "buy_approved": true,
+    "cash": 996.9463370028997,
+    "fills": [
+      {
+        "time": 1792269673.776726,
+        "mint": "77777777777777777777777777777777777777777777",
+        "side": "sell",
+        "units": 13877.91563275434,
+        "price": 0.0008,
+        "net_usd": 10.978337002899746,
+        "pnl_usd": -3.053662997100254,
+        "reason": "stop_loss",
+        "wallets": "[\"wallet_a\", \"wallet_b\"]",
+        "liquidity": 1754.0
+      },
+      {
+        "time": 1792269673.776532,
+        "mint": "77777777777777777777777777777777777777777777",
+        "side": "buy",
+        "units": 13877.91563275434,
+        "price": 0.001,
+        "net_usd": -14.032,
+        "pnl_usd": 0.0,
+        "reason": "multi-wallet entry",
+        "wallets": "[\"wallet_a\", \"wallet_b\"]",
+        "liquidity": 1754.0
+      }
+    ],
+    "diagnostics": {
+      "mode": "observed inputs / simulated paper execution",
+      "count_unit": "stage events (retries included), not unique trades",
+      "detected_mints": 0,
+      "counts": [
+        {
+          "stage": "broker",
+          "code": "approved",
+          "count": 1
+        },
+        {
+          "stage": "paper",
+          "code": "filled",
+          "count": 2
+        }
+      ],
+      "recent": [
+        {
+          "time": 1792269673.7768462,
+          "mint": "77777777777777777777777777777777777777777777",
+          "stage": "paper",
+          "code": "filled",
+          "details": {
+            "side": "sell",
+            "pnl_usd": -3.053662997100254,
+            "modeled_slippage": 0.006664861033695403,
+            "fee_usd": 0.05
+          }
+        },
+        {
+          "time": 1792269673.7767122,
+          "mint": "77777777777777777777777777777777777777777777",
+          "stage": "paper",
+          "code": "filled",
+          "details": {
+            "side": "buy",
+            "allocation_usd": 14.032
+          }
+        },
+        {
+          "time": 1792269673.7766232,
+          "mint": "77777777777777777777777777777777777777777777",
+          "stage": "broker",
+          "code": "approved",
+          "details": {
+            "allocation_usd": 14.032,
+            "estimated_slippage": 0.0075,
+            "fee_usd": 0.05
+          }
+        }
+      ]
+    }
+  }
+}

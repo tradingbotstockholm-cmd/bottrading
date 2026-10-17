@@ -145,9 +145,9 @@ def fetch_curve_quote(mint:str, expected_curve:str|None, rpc_url:str)->Quote|Non
     # Fetch both accounts at ONE confirmed slot. A newer curve has `quote_mint`
     # (32 bytes at offset 83); it MUST be the zero pubkey for SOL-denominated
     # pairs. Never misread a USDC/pump-coin quote reserve as native lamports.
-    res=post_json(rpc_url,{'jsonrpc':'2.0','id':1,'method':'getMultipleAccounts',
-        'params':[[expected_curve,mint],{'encoding':'base64','commitment':'confirmed'}]},timeout=5)
-    result=res.get('result') or {}
+    from .chain import shared_client
+    result=shared_client(rpc_url).call('getMultipleAccounts',
+        [[expected_curve,mint],{'encoding':'base64','commitment':'confirmed'}],transport=post_json) or {}
     accounts=result.get('value')
     if not isinstance(accounts,list) or len(accounts)!=2:return None
     curve_account,mint_account=accounts

@@ -8,7 +8,7 @@ from .bonding_quote import fetch_curve_quote
 from hunter.feed import Feed
 from hunter.fomo import from_cli,from_file,B58
 from hunter.signals import Consensus
-from .chain import SolanaClient,WalletPoller,extract_wallet_trades
+from .chain import SolanaClient,WalletPoller,extract_wallet_trades,shared_client
 from .broker import Broker
 from .db import Database
 from .security import SecurityGate
@@ -19,6 +19,7 @@ log=logging.getLogger('hunter2')
 
 @dataclasses.dataclass
 class Settings(Config):
+    assumed_slippage_pct:float=0.0035
     db_path:str='data/hunter2.sqlite'
     poll_public_wallet_rpc:bool=True
     wallet_poll_seconds:int=35
@@ -50,6 +51,7 @@ class Settings(Config):
     enable_paid_token_stream:bool=False
     paid_token_stream_limit:int=32
     # PAPER ONLY heuristic sizing; not a trained probability of profit.
+    max_paper_slippage_pct:float=0.0075
     adaptive_paper_sizing:bool=True
     # Paper entries are not constrained by token market-cap band unless opted in.
     # Recorded positive cap is still required to verify USD quotes.
@@ -59,6 +61,7 @@ class Settings(Config):
 
     def validate(self):
         super().validate()
+        if not 0<self.max_paper_slippage_pct<0.5:raise ValueError("invalid paper slippage ceiling")
         if (self.enable_paid_wallet_stream or self.enable_paid_token_stream) and not os.getenv('PUMPPORTAL_API_KEY'):
             raise ValueError('Paid trade subscriptions require explicit PUMPPORTAL_API_KEY')
         if type(self.adaptive_paper_sizing) is not bool:raise ValueError('invalid adaptive sizing flag')
@@ -142,7 +145,7 @@ class Hunter:
         self.security=SecurityGate(cfg.solana_rpc_url,cfg.rug_score_ceiling,cfg.require_rugcheck,
                                   paper_exploratory=cfg.paper_exploratory_rug,
                                   paper_rug_score_ceiling=cfg.paper_rug_score_ceiling)
-        self.client=SolanaClient(cfg.solana_rpc_url)
+        self.client=shared_client(cfg.solana_rpc_url)
         self.poller=WalletPoller(self.client,self.db,cfg.wallet_signatures_per_poll)
         self.scout=TraderScout(self.client,self.db,extract_wallet_trades,
             minimum_buys=cfg.scout_min_buys,minimum_mints=cfg.scout_min_distinct_mints,
@@ -195,6 +198,11 @@ class Hunter:
                 'scout_live_consensus':self.cfg.enable_scout_live_consensus,
                 'paid_token_stream':self.cfg.enable_paid_token_stream,
                 'paid_wallet_stream':self.cfg.enable_paid_wallet_stream,
+                'feed_connected':bool(getattr(getattr(self,'feed',None),'connected',False)),
+                'rpc_requests':self.client.requests,
+                'rpc_errors':self.client.errors,
+                'rpc_cooldowns':{k:max(0,round(v-time.monotonic(),1)) for k,v in self.client._cooldown_until.copy().items()},
+                'feed_last_event_age_seconds':None if not getattr(self,'last_feed_event',0) else round(time.time()-self.last_feed_event,1),
                 'mode':'PAPER',
             }
             try:await asyncio.to_thread(self.db.record_runtime,report)
@@ -232,10 +240,11 @@ class Hunter:
             self.db.remember_mint(mint,curve,'pumpportal')
         trader=event.get('traderPublicKey')
         if trader in self.tracked and side in ('buy','sell'):
-            self.consensus.record(mint,trader,side)
-            self.db.observe(mint,'wallet_'+side,trader[:12]+'… / pumpportal')
+            self.db.diagnostic(mint,'wallet','unverified_websocket_hint',{'side':side})
+            # Only confirmed RPC signer evidence may create consensus votes.
     async def enqueue_market_event(self,event):
         # No database or network I/O on the PumpPortal websocket receiver.
+        self.last_feed_event=time.time()
         launch=launch_event(event)
         if launch is not None:
             self.market_received+=1
@@ -356,7 +365,7 @@ class Hunter:
                         try:
                             signals=await asyncio.to_thread(self.poller.poll,wallet)
                             for sg in signals:
-                                self.consensus.record(sg.mint,sg.wallet,sg.side)
+                                self.consensus.record(sg.mint,sg.wallet,sg.side,now=sg.observed_at)
                                 self.db.observe(sg.mint,'rpc_'+sg.side,f'{sg.wallet[:9]} signature={sg.signature[:12]}')
                         except Exception as exc:self.db.record_error('wallet_rpc',type(exc).__name__)
             except Exception as exc:self.db.record_error('wallet_cycle',type(exc).__name__)
@@ -383,44 +392,58 @@ class Hunter:
         now=time.time()
         if mint in self.broker.state()['positions'] or now-self.last_attempt.get(mint,0)<30:return
         voters=self.consensus.voters(mint)
-        if len(set(voters))<self.cfg.min_distinct_wallets:return
+        if len(set(voters))<self.cfg.min_distinct_wallets:
+            self.db.diagnostic(mint,'consensus','consensus_missing_or_expired');return
         self.last_attempt[mint]=now
+        self.db.diagnostic(mint,'consensus','confirmed',{'wallets':len(set(voters))})
         try:
             quote=await asyncio.to_thread(self.market_quote,mint)
-            if quote is None:
-                self.db.observe(mint,'reject','no indexed DEX price or verified on-chain USD bonding-curve quote');return
+            reason=self.broker.quote_rejection(quote)
+            if reason:
+                self.db.diagnostic(mint,'quote',reason)
+                self.db.observe(mint,'reject',reason);return
             self.db.record_price_sample(quote)
+            self.db.diagnostic(mint,'quote','verified',{'source':quote.dex_id,'liquidity_usd':quote.liquidity_usd})
+            if quote.liquidity_usd<self.cfg.min_liquidity_usd:
+                self.broker.reject(mint,'liquidity_below_minimum',actual=quote.liquidity_usd,minimum=self.cfg.min_liquidity_usd);return
             if self.cfg.enforce_paper_market_cap and not (
                 self.cfg.min_market_cap_usd<=quote.market_cap_usd<=self.cfg.max_market_cap_usd
             ):
-                self.db.observe(mint,'reject',f'market cap ${quote.market_cap_usd:.0f} outside configured range');return
-            curve=self.db.curve_owner(mint)
-            risk=await asyncio.to_thread(self.security.examine,mint,curve)
+                self.broker.reject(mint,'market_cap_outside_policy');return
+            risk=await asyncio.to_thread(self.security.examine,mint,self.db.curve_owner(mint))
             if not risk.approved:
+                code='confirmed_critical_security_risk' if any(
+                    x in '; '.join(risk.reasons).lower() for x in ('authority active','rugcheck:','large non-curve')) else 'rug_verification_failure'
+                self.db.diagnostic(mint,'security',code,{'reasons':list(risk.reasons)})
                 self.db.observe(mint,'rug_reject','; '.join(risk.reasons));return
+            provisional=getattr(risk,'provisional',False)
+            self.db.diagnostic(mint,'security','provisional' if provisional else 'approved',
+                {'score':risk.score,'notes':list(getattr(risk,'notes',()))})
+            # Network work can outlive both consensus TTL and the quote TTL.
+            now=time.time()
+            voters=self.consensus.voters(mint,now)
+            if len(set(voters))<self.cfg.min_distinct_wallets:
+                self.db.diagnostic(mint,'consensus','consensus_missing_or_expired');return
             vote_times=self.consensus.events.get(mint,{})
-            oldest_age=max((now-float(vote_times.get(w,now)) for w in voters),default=self.cfg.signal_ttl_seconds)
+            oldest_age=max((now-float(vote_times[w]) for w in voters),default=self.cfg.signal_ttl_seconds)
             strength=paper_signal_strength(voters=len(set(voters)),oldest_buy_age_seconds=oldest_age,
                 ttl_seconds=self.cfg.signal_ttl_seconds,liquidity_usd=quote.liquidity_usd,
                 minimum_liquidity_usd=self.cfg.min_liquidity_usd,rug_score=risk.score,
                 maximum_rug_score=self.cfg.rug_score_ceiling)
-            provisional=getattr(risk,'provisional',False)
             if provisional:
-                # A partial rug audit does not get to scale up with wallet votes.
-                # Default adaptive broker maps strength 0 to the $2 minimum;
-                # if sizing is disabled, REFUSE this experimental entry.
                 if not self.cfg.adaptive_paper_sizing:
-                    self.db.observe(mint,'rug_reject','provisional security requires adaptive $2 sizing');return
+                    self.db.diagnostic(mint,'security','provisional_requires_minimum_sizing');return
                 strength=0.0
                 self.db.observe(mint,'paper_rug_uncertain','; '.join(getattr(risk,'notes',())))
-            if self.broker.buy(quote,voters,signal_strength=strength if self.cfg.adaptive_paper_sizing else None):
+            if self.broker.buy(quote,voters,signal_strength=strength if self.cfg.adaptive_paper_sizing else None,
+                    security_evidence={'status':'provisional' if provisional else 'approved','score':risk.score,'notes':list(getattr(risk,'notes',()))}):
+                self.consensus.events.pop(mint,None)
                 basis=self.broker.state()['positions'][mint]['basis']
-                self.db.observe(mint,'paper_buy',f'{len(voters)} independent wallets; '
-                    f'paper allocation=${basis:.2f}; signal strength={strength:.3f} (heuristic, not win probability); '
-                    f'cap=${quote.market_cap_usd:.0f}; rug score={risk.score}; provisional={provisional}')
-            else:
-                self.db.observe(mint,'reject','paper broker allocation, liquidity, slippage or account risk limit')
+                self.db.observe(mint,'paper_buy',f'{len(voters)} independent wallets; paper allocation=${basis:.2f}; '
+                    f'signal strength={strength:.3f}; provisional={provisional}')
+        except asyncio.CancelledError:raise
         except Exception as exc:
+            self.db.diagnostic(mint,'entry','internal_exception',{'type':type(exc).__name__})
             self.db.record_error('entry',f'{mint[:12]} {type(exc).__name__}')
     async def _bounded_entry(self,mint):
         # Bound total quote/security calls to protect the RPC/data providers.
@@ -469,7 +492,14 @@ class Hunter:
             await asyncio.gather(*(self._check_position(m,p) for m,p in selected))
 
     async def tick(self):
-        pool=[m for m in list(self.consensus.events) if self.consensus.consensus(m,self.cfg.min_distinct_wallets)]
+        pool=[]
+        positions=self.broker.state()['positions']
+        for mint in list(self.consensus.events):
+            had_votes=bool(self.consensus.events[mint])
+            if mint in positions:continue
+            if self.consensus.consensus(mint,self.cfg.min_distinct_wallets):pool.append(mint)
+            elif had_votes:self.db.diagnostic(mint,'consensus','consensus_missing_or_expired')
+        pool.sort(key=lambda m:self.last_attempt.get(m,0))
         if pool:await asyncio.gather(*(self._bounded_entry(m) for m in pool[:self.cfg.max_price_checks_per_cycle]))
         await self.check_positions()
     async def price_loop(self):
@@ -483,7 +513,8 @@ class Hunter:
                 await self.wallets()
                 streamwallets=self.tracked if self.cfg.enable_paid_wallet_stream else []
                 supplier=(lambda:self.db.paid_token_targets(self.cfg.paid_token_stream_limit)) if self.cfg.enable_paid_token_stream else None
-                await Feed(self.cfg.pumpportal_websocket_url).stream(streamwallets,self.enqueue_market_event,
+                self.feed=Feed(self.cfg.pumpportal_websocket_url)
+                await self.feed.stream(streamwallets,self.enqueue_market_event,
                     lambda:self.tracked if self.cfg.enable_paid_wallet_stream else [],token_supplier=supplier)
             except Exception as exc:
                 self.db.record_error('pumpportal_feed',type(exc).__name__)

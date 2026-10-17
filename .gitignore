@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+config.json
+config.v4.json
+config.cloud.json
+accounts.json
+live.json
+*.log

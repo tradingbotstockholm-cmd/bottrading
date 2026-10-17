@@ -16,7 +16,8 @@ from hunter2.security import SecurityGate, SecurityVerdict
 from hunter4.__main__ import PaperHunterV4
 
 M='7'*44
-C='8'*44
+from hunter2.bonding_quote import canonical_curve_address
+C=canonical_curve_address(M)
 A='A'*44
 B='B'*44
 GOOD={'score_normalised':10,'risks':[]}

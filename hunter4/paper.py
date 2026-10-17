@@ -10,38 +10,27 @@ from .principal import plan_principal_recovery,defensive_exit
 class CapitalRecoveryBroker(Broker):
     def __init__(self,db,config):
         super().__init__(db,config)
-        self.max_estimated_slippage=0.0075
+        self.max_estimated_slippage=getattr(config,'max_paper_slippage_pct',0.0075)
         self.recovery_multiple=2.0
-    @serialized
-    def buy(self,q,wallets,now=None,*,signal_strength=None):
-        if q is None:return False
-        s=self.state()
-        # Match the *actual* allocation in Broker.buy. Using a smaller
-        # hypothetical size here understates execution slippage and can
-        # approve fills above the paper broker's own 0.75% safety limit.
-        amount=self.planned_allocation(s,q.liquidity_usd,signal_strength) if q.liquidity_usd>0 else 0
-        if amount<=0 or self._slip(amount,q.liquidity_usd)>self.max_estimated_slippage:return False
-        ok=super().buy(q,wallets,now,signal_strength=signal_strength)
-        if ok:
-            s=self.state();p=s['positions'][q.mint]
-            p.update(initial_basis_usd=p['basis'],initial_units=p['units'],
-                     proceeds_usd=0.0,principal_done=False)
-            self.db.save_state(s)
-        return ok
-    @serialized
-    def exit(self,mint,q,fraction=1,reason='exit',now=None):
-        result=super().exit(mint,q,fraction,reason,now)
-        if result is not None and reason=='principal_recovery':
-            rows=self.db.recent_fills(1)
-            if rows:
-                proceeds=float(rows[0]['net_usd'])
-                s=self.state();p=s['positions'].get(mint)
-                if p is not None:
-                    p['proceeds_usd']=p.get('proceeds_usd',0)+proceeds
-                    p['principal_done']=p['proceeds_usd']>=p.get('initial_basis_usd',float('inf'))
-                    p['partial2']=p['principal_done']
-                    self.db.save_state(s)
-        return result
+    def planned_allocation(self,s,liquidity_usd,signal_strength=None):
+        amount=super().planned_allocation(s,liquidity_usd,signal_strength)
+        # Solve the broker's actual impact model before choosing the order size.
+        # Preserve legacy non-adaptive policy; never enlarge a target or relax risk.
+        if signal_strength is not None and self.cfg.adaptive_paper_sizing:
+            impact_budget=max(0.0,self.max_estimated_slippage-self.cfg.assumed_slippage_pct)
+            amount=min(amount,2*liquidity_usd*impact_budget)
+        return amount
+    def position_fields(self,allocation,units):
+        # Written atomically with the position and buy fill, before any commit.
+        return dict(initial_basis_usd=allocation,initial_units=units,
+                    proceeds_usd=0.0,principal_done=False)
+    def apply_exit_metadata(self,position,net,reason):
+        super().apply_exit_metadata(position,net,reason)
+        if reason=='principal_recovery':
+            position['proceeds_usd']=position.get('proceeds_usd',0)+net
+            position['principal_done']=position['proceeds_usd']>=position.get('initial_basis_usd',float('inf'))
+            position['partial2']=position['principal_done']
+        if reason=='5x_runner':position['partial5']=True
     @serialized
     def mark(self,q,now=None):
         now=time.time() if now is None else now
@@ -62,7 +51,7 @@ class CapitalRecoveryBroker(Broker):
                 high_price=p['high'],hard_stop_fraction=.07,trailing_fraction=.08)
         if not reason and now-p['entry_time']>=self.cfg.max_hold_seconds:reason='time_exit'
         if not reason and p.get('pending_exit'):reason=p['pending_exit']
-        if reason:return [self.exit(q.mint,q,1,reason,now)]
+        if reason:return [self.exit(q.mint,q,p.get('pending_exit_fraction',1) if reason==p.get('pending_exit') else 1,reason,now)]
         if not p.get('principal_done') and p.get('initial_basis_usd') and p.get('initial_units'):
             plan=plan_principal_recovery(remaining_units=p['units'],initial_units=p['initial_units'],
                 entry_cost_usd=p['initial_basis_usd'],recovered_usd=p.get('proceeds_usd',0),
@@ -74,13 +63,5 @@ class CapitalRecoveryBroker(Broker):
             if plan:
                 return [self.exit(q.mint,q,plan.fraction,'principal_recovery',now)]
         if p.get('principal_done') and q.price_usd/p['entry_price']>=5 and not p['partial5']:
-            # Record completion only after an actual simulated fill. If modeled
-            # liquidity prevents the exit, keep the runner eligible to retry.
-            realized=self.exit(q.mint,q,.15,'5x_runner',now)
-            if realized is not None:
-                updated=self.state()
-                if q.mint in updated['positions']:
-                    updated['positions'][q.mint]['partial5']=True
-                    self.db.save_state(updated)
-            return [realized]
+            return [self.exit(q.mint,q,.15,'5x_runner',now)]
         return []

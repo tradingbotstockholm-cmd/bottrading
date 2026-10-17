@@ -1,65 +1,99 @@
-# SOLANA HUNTER V4 — capital recovery and stricter safeguards
+# Solana Hunter — observable paper execution
 
-**NEW: [SECURITY_AND_CAPITAL.md](SECURITY_AND_CAPITAL.md)** — read the funding, slippage, and risk limitations first.
+Research and simulated trading only. The paper launcher never imports the live
+order gateway, signs transactions, funds a wallet, or subscribes to paid feeds.
+Existing experimental V3 live modules remain disabled by default and are outside
+this paper workflow.
 
-- Paper V4: `bash run_v4_paper_mac.sh` and `bash dashboard_v4_mac.sh` (separate V4 ledger, never mixes V2 trade history).
-- Wallet setup: `bash setup_mac.sh`, `source .venv/bin/activate`, `python -m hunter3 init`.
-- Automated live code is experimental, **disabled by default**, not mainnet-proven. Original V3 notes below are retained.
-- Settlement ledger now limits recycling to **confirmed realized principal recovery**, with 0.75% slippage tolerance (not guaranteed execution), strict locks, 3%/15% allocation and lifetime turnover controls.
+## One-command start (macOS Intel or Linux)
 
----
-
-# SOLANA HUNTER V3 — isolated funding + experimental live executor
-
-**Start here: [`V3_SETUP.md`](V3_SETUP.md).** It contains the complete new-email / Phantom / FOMO / Pump.fun / PumpPortal linking process, funding instructions, macOS Keychain setup, safeguards, and emergency stop.
-
-## What is implemented
-
-The original V2 paper trading system is retained. V3 adds public wallet identity configuration, on-chain confirmed SOL balance checks, PumpPortal Lightning order adapter, distinct live order ledger, manual and signal-driven experimental live orders, transaction-status and token-balance reconciliation, and an independently killable live-runner. It includes a read-only localhost wallet dashboard on port 8766.
-
-The experimental live order route uses the **PumpPortal Lightning API and its own isolated wallet**, *not* your primary Phantom wallet, *not* the FOMO app embedded wallet, and *not* an authenticated API for the FOMO app. Its API key can trade with the wallet's funds and must be tightly protected. No Phantom or FOMO recovery phrase/private key is used or required.
-
-**Important limitation**: We do not have live API credentials, a provisioned wallet, or permission to send live test transactions. Offline mocked tests passing does not prove actual execution, profitability, or exit reliability. No bot can guarantee no losses, 10x/100x, or daily profits. Do not fund with money you cannot lose.
-
-## Quick installation (Mac)
+Install Python 3.11+ first, then run from the extracted Git source checkout:
 
 ```bash
-unzip Solana_Hunter_V3_Wallet_Trading_Integration.zip
-cd solana_hunter_v3
+bash start_paper_mac.sh
+```
+
+This creates `.venv` if needed, installs `requirements.txt`, runs the tests,
+copies `config.v4.example.json` only when `config.v4.json` is missing, backs up
+an existing V4 SQLite database using SQLite's WAL-aware backup API, and starts
+both the local dashboard and V4 paper scanner. Control+C stops both processes.
+Open the dashboard locally on loopback port 8765. Cloud onboarding does not expose
+a localhost preview. Run only one scanner per ledger.
+
+Existing configs and paper/research data are preserved. `config.v4.REDACTED.json`
+is an audit artifact, not a usable configuration. The old Mac launcher scripts
+are retained. V2 `config.example.json` uses `data/hunter2.sqlite`; V4 uses the
+separate `data/hunter4_paper.sqlite`. Do not point V2 and V4 at the same ledger.
+
+## Policy and why some small tokens still do not trade
+
+The V4 example config sets 200 positions, $1,000 initial simulated cash, $100
+minimum liquidity, no entry market-cap band, adaptive $2–$1,000 purchase targets,
+0.35% base modeled slippage and a 0.75% modeled buy-slippage ceiling. Exposure,
+cash, fees, independent-address consensus, quote freshness and rug checks still
+apply. A position target is reduced to fit the actual impact model before entry.
+A provisional security result is stored on the position and limited to the $2
+target. Known critical findings always reject, even if a later RPC call fails.
+
+The impact model is `base_slippage + 0.5 * allocation / liquidity`. With these
+settings, a $2 minimum requires at least $250 observed liquidity. Tokens with
+$100–$154 liquidity still fail the impact budget; $100 is a screening threshold,
+not permission to bypass the $2 minimum or fabricate liquidity. At $1,754
+liquidity the largest permitted allocation is $14.032. Slippage is an estimate,
+not a guaranteed executable price or evidence of profitability.
+
+If an **existing** config has `assumed_slippage_pct >= max_paper_slippage_pct`,
+no buy can satisfy the policy. Review those fields explicitly; installation does
+not overwrite user configs or loosen their safeguards.
+
+## Validation and observability
+
+```bash
 bash setup_mac.sh
 source .venv/bin/activate
-python -m hunter3 init
-# Enter PUBLIC Solana addresses into accounts.json, live.json
-python -m hunter3 balances
-python -m hunter3 doctor
-bash run_mac.sh
-```
-
-In separate Terminal windows (same folder), dashboards:
-
-```bash
-bash dashboard_mac.sh       # V2 paper: http://127.0.0.1:8765
-bash dashboard_live_mac.sh  # V3 public wallets+read-only live ledger: http://127.0.0.1:8766
-```
-
-Live trading remains **OFF** by default. To explore explicit authorization and isolated wallet configuration, read `V3_SETUP.md`. Do not paste seed phrases, credentials, PINs or passwords into any files or the chat.
-
-## Code map
-
-- `hunter/`: V1 public data, signals, rug checks, paper model
-- `hunter2/`: V2 scanning pipeline, copy-wallet tracking, state ledger, paper dashboard
-- `hunter3/accounts.py`: public wallet identifiers and on-chain SOL balance checks
-- `hunter3/orders.py`: hard caps, durable order status, PumpPortal Lightning API, RPC confirmation
-- `hunter3/autolive.py`: opt-in live strategy using the V2 scanner/filters and V3 isolated wallet
-- `hunter3/cli.py`: init/balances/doctor/status/manual orders/stop/reconcile/run-live
-- `hunter3/dashboard.py`: read-only 127.0.0.1 live status dashboard
-- `tests/test_v3.py`: mocked trade and failure tests, no real funds
-
-## Local verification
-
-```bash
 python -m unittest discover -s tests -v
-python -m compileall -q hunter hunter2 hunter3
+python -m compileall -q hunter hunter2 hunter3 hunter4
+python -m hunter2 status --config config.v4.json
+python -m hunter2.live_probe
 ```
 
-This repository is a research prototype, **not** audited production trading software. The most significant gaps are: provider-wallet/API-key binding cannot be verified from public APIs; FOMO app has no verified supported order API; provider/network outage, transaction ordering, token sellability, and mainnet cost assumptions need controlled real-world validation before relying on unattended operation.
+The read-only live probe subscribes only to the free launch feed and checks public
+providers. It returns a failing exit status on connectivity errors. Connectivity,
+a launch receipt and deterministic fixtures do not prove a market-triggered fill.
+
+The dashboard's **Execution Diagnostics** section and `execution_diagnostics` in
+`/api/state` show persisted stage/outcome codes, candidate mint, time and details:
+Detected → Consensus → Quoted → Security Checked → Broker Approved → Paper Filled.
+Counts are stage events including retries, not unique conversion counts. The
+latest 200 stage events are displayed; observations remain in SQLite. Search
+historical candidates read-only, for example:
+
+```sql
+SELECT time,mint,json_extract(detail,'$.stage') AS stage,
+       json_extract(detail,'$.code') AS outcome,detail
+FROM observations WHERE kind='execution' AND mint=? ORDER BY id;
+```
+
+Health includes heartbeat, last feed connection state, last event age, shared RPC
+requests/errors and method cooldowns. Broker rejections distinguish missing/stale
+quotes, liquidity, impact, consensus, invalid sizing confidence, cash, exposure,
+position limits, duplicates, pause and daily loss limits. Security and internal
+errors are distinct stages. Paper fills include modeled costs; equity/unrealized
+PnL use the existing indicative `units * last_price * 0.98` mark, not an executable
+liquidation quote. No synthetic aggregate stress PnL is included in paper metrics.
+Provisional evidence is shown separately on open positions.
+
+## Current evidence and limitations
+
+See [AUDIT_REPAIR.md](AUDIT_REPAIR.md) for exact defects, test evidence and live
+network blockers. `audit/broker_before_after.json` is a **synthetic** comparison;
+`audit/live_probe.json` is the separate actual connectivity result. Tests use
+isolated temporary databases; never import them into the observed-market ledger.
+
+Confirmed RPC swaps are heuristics based on known trading programs, signer-owned
+token deltas and economic consideration, not full instruction-level execution
+verification. Distinct public signer addresses do not prove distinct humans or
+exclude coordinated wallets. Trader discovery measures activity, not profit.
+Public RPC throttling and sparse sampling may miss valid opportunities. No live
+paper fill, actual macOS hardware run, profitability or unattended mainnet
+readiness is claimed by the deterministic tests.

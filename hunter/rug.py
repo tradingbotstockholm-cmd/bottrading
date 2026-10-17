@@ -8,8 +8,8 @@ class SolanaRPC:
         self.endpoint=endpoint
 
     def call(self, method: str, params: list):
-        data=post_json(self.endpoint, {'jsonrpc':'2.0','id':1,'method':method,'params':params})
-        return data.get('result')
+        from hunter2.chain import shared_client
+        return shared_client(self.endpoint).call(method,params,transport=post_json)
 
     def examine(self, mint: str, bonding_curve_owner: str | None=None) -> RiskResult:
         reasons=[]
@@ -46,6 +46,6 @@ class SolanaRPC:
                 reasons.append(f'large non-curve token accounts: {share:.1%} of supply')
             return RiskResult(not reasons, reasons, share)
         except (KeyError, ValueError, TypeError, IndexError, ZeroDivisionError) as e:
-            return RiskResult(False,[f'malformed RPC response: {e}'])
+            return RiskResult(False,reasons+[f'malformed RPC response: {type(e).__name__}'])
         except Exception as e:
-            return RiskResult(False,[f'risk data unavailable: {type(e).__name__}: {e}'])
+            return RiskResult(False,reasons+[f'risk data unavailable: {type(e).__name__}: {e}'])

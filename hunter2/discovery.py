@@ -107,6 +107,13 @@ class TraderScout:
                 rows = self.client.signatures(key, self.limit)
                 if not isinstance(rows, list):
                     raise ValueError('invalid signatures response')
+                # Persist retrieval work before RPC fetches so 429s and a moving
+                # latest-signature window cannot silently drop unprocessed swaps.
+                pending=[row['signature'] for row in rows if isinstance(row,dict)
+                         and isinstance(row.get('signature'),str) and row['signature']
+                         and not row.get('err') and not self.ledger.scout_signature_seen(mint,row['signature'])]
+                self.ledger.enqueue_pending('scout:'+mint,pending)
+                rows=[{'signature':sig} for sig in self.ledger.pending_signatures('scout:'+mint,max(self.limit,self.tx_budget))]
                 completed = True
                 for row in rows:
                     if not isinstance(row, dict) or row.get('err'):
@@ -132,7 +139,7 @@ class TraderScout:
                     # a delayed paper order.
                     bt=tx.get('blockTime') if isinstance(tx,dict) else None
                     fresh=(isinstance(bt,(int,float)) and not isinstance(bt,bool)
-                           and math.isfinite(bt) and -3 <= now-float(bt)
+                           and math.isfinite(bt) and 0 <= now-float(bt)
                            <= self.signal_max_age_seconds)
                     for wallet in signer_wallets(tx):
                         if wallet == creator or self.ledger.is_known_creator(wallet):

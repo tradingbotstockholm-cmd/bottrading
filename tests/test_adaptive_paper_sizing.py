@@ -64,8 +64,10 @@ class AdaptiveSizingTests(unittest.TestCase):
         db.set_entries_paused(True)
         self.assertFalse(b.buy(self.quote(),[A,B],signal_strength=1))
         db.set_entries_paused(False)
-        self.assertFalse(b.buy(self.quote(liq=3000),[A,B],signal_strength=1))  # slippage guard
-        self.assertEqual(db.recent_fills(),[])
+        self.assertTrue(b.buy(self.quote(liq=3000),[A,B],signal_strength=1))
+        position=db.state()['positions'][M]
+        self.assertLessEqual(b._slip(position['basis'],3000),b.max_estimated_slippage+1e-12)
+        self.assertLessEqual(position['basis'],24)
     def test_configuration_and_dashboard(self):
         cfg=self.cfg();cfg.validate()
         for low,high in ((1,1000),(2,1001),(200,10),(float('nan'),1000),(2,float('inf'))):
