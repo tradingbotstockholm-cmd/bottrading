@@ -1,0 +1,6 @@
+Solana Hunter V3 — local automated test report
+2026-10-17
+90 / 90 unittest tests passed; all execution tests are mocked and NO live transactions were submitted.
+Dashboard GET /health and /api/state smoke tested.
+Python compileall passes.
+See V3_VERIFICATION.md for limitations.
