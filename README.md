@@ -25,6 +25,14 @@ is an audit artifact, not a usable configuration. The old Mac launcher scripts
 are retained. V2 `config.example.json` uses `data/hunter2.sqlite`; V4 uses the
 separate `data/hunter4_paper.sqlite`. Do not point V2 and V4 at the same ledger.
 
+## Update an existing Mac installation safely
+
+Follow [the staged Mac update and rollback procedure](docs/MAC_PAPER_UPDATE.md).
+It pins the repair commit, backs up the whole old project and SQLite WAL state,
+preserves user settings/history, migrates only the historical 1%/0.75% paper
+slippage conflict, and leaves real-money execution disabled. The actual Mac
+installation must be validated there; cloud preparation does not deploy it.
+
 ## Policy and why some small tokens still do not trade
 
 The V4 example config sets 200 positions, $1,000 initial simulated cash, $100
